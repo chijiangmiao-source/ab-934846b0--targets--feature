@@ -1,0 +1,13 @@
+{
+  "name": "tuf-offline-review",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "TUF 风格 Root 轮换与 Targets 授权的离线复核台（浏览器 Worker 内完成验签）",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node tests/run-tests.js",
+    "serve": "node server/server.js",
+    "verify": "node scripts/verify.js"
+  }
+}

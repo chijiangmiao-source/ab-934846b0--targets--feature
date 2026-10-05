@@ -1,0 +1,42 @@
+# 离线复核验收编排：
+#   web    —— 静态页面服务（宿主端口由 WEB_PORT 配置，默认 8080），含 /health 健康接口
+#   verify —— 页面构建 + 代码规则测试 + 健康接口 HTTP 冒烟，完成后退出并以退出码报告验收状态
+#
+# 用法：
+#   WEB_PORT=8080 docker compose up --build --exit-code-from verify
+#   echo $?   # 0 = 验收通过，非 0 = 验收失败
+#   docker compose down
+
+x-app: &app
+  build: .
+  image: tuf-offline-review:local
+
+services:
+  web:
+    <<: *app
+    command: ["node", "server/server.js"]
+    environment:
+      PORT: "8080"
+      WEB_ROOT: /app/dist
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  verify:
+    <<: *app
+    command: ["node", "scripts/verify.js"]
+    environment:
+      SMOKE_BASE_URL: http://web:8080
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: "no"

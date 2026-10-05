@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>安全审查 · 离线复核台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>安全审查 · 离线复核台</h1>
+    <p>
+      录入审查时刻、按版本排序的 Root 元数据链（至多 6 份）与一份 Targets 元数据，
+      复核计算全部在浏览器 Worker 内离线完成，不发出任何网络请求。
+    </p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>① 录入</h2>
+      <label class="field">
+        <span>审查时刻（ISO 8601，晚于 Targets 过期时间即不予授权）</span>
+        <input id="review-time" type="text" spellcheck="false" placeholder="2026-10-05T00:00:00Z">
+      </label>
+
+      <div id="root-slots"></div>
+
+      <label class="field">
+        <span>Targets 元数据（1 份）</span>
+        <textarea id="targets-input" rows="9" spellcheck="false"
+          placeholder='{"signed":{"_type":"targets",...},"signatures":[...]}'></textarea>
+      </label>
+
+      <div class="actions">
+        <button id="btn-verify" class="primary">开始离线复核</button>
+        <button id="btn-clear" type="button">清空</button>
+        <span class="examples">
+          载入示例：
+          <button type="button" data-fixture="legit-rotation">合法轮换</button>
+          <button type="button" data-fixture="old-root-only">旧根单签拒绝</button>
+          <button type="button" data-fixture="expired-targets">过期 Targets</button>
+        </span>
+      </div>
+      <p id="busy" class="busy" hidden>复核计算中（Worker）…</p>
+    </section>
+
+    <section class="panel" id="error-panel" hidden>
+      <h2>执行错误</h2>
+      <pre id="error-text"></pre>
+    </section>
+
+    <section class="panel" id="result-panel" hidden>
+      <h2>② 逐轮结果</h2>
+      <div id="rounds"></div>
+      <h2>③ Targets 阶段</h2>
+      <div id="targets-stage"></div>
+      <h2>④ 结论</h2>
+      <div id="conclusion"></div>
+    </section>
+  </main>
+
+  <footer>
+    <p>规则：签名仅覆盖字段名排序后的 UTF-8 <code>signed</code> 对象；密钥标识取规范公钥对象的 SHA-256；仅接受 Ed25519。</p>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
