@@ -141,4 +141,82 @@ export function buildExpiredTargets() {
   };
 }
 
-export const scenarioBuilders = [buildLegitRotation, buildOldRootOnly, buildExpiredTargets];
+// 委托目标：顶层 Targets 声明两级委托（按声明顺序）——
+//   frontend（terminating，路径 app-*，D1+D2 阈值 2）→ misc（非终止，路径 *，D3 阈值 1）。
+// 目标 app-2.0.0.bin 只出现在 frontend 的受委托元数据中。
+export function buildDelegatedTarget() {
+  const A = h.genKey('A');
+  const B = h.genKey('B');
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const D2 = h.genKey('D2');
+  const D3 = h.genKey('D3');
+
+  const v1 = h.makeRoot({
+    version: 1,
+    keys: [A, B, Ta],
+    rootKeys: [A, B],
+    rootThreshold: 2,
+    targetsKeys: [Ta],
+    targetsThreshold: 1,
+  });
+  h.addSignature(v1, A);
+  h.addSignature(v1, B);
+
+  const targets = h.makeTargets({
+    version: 1,
+    expires: '2030-01-01T00:00:00Z',
+    targets: {
+      'base.txt': { length: 10, hashes: { sha256: h.digestOf('base-payload') } },
+    },
+  });
+  targets.signed.delegations = {
+    keys: {
+      [h.keyidOf(D1)]: h.keyObjectOf(D1),
+      [h.keyidOf(D2)]: h.keyObjectOf(D2),
+      [h.keyidOf(D3)]: h.keyObjectOf(D3),
+    },
+    roles: [
+      {
+        name: 'frontend',
+        keyids: [h.keyidOf(D1), h.keyidOf(D2)],
+        threshold: 2,
+        terminating: true,
+        paths: ['app-*'],
+      },
+      {
+        name: 'misc',
+        keyids: [h.keyidOf(D3)],
+        threshold: 1,
+        terminating: false,
+        paths: ['*'],
+      },
+    ],
+  };
+  h.addSignature(targets, Ta);
+
+  const delegated = h.makeTargets({
+    version: 1,
+    expires: '2030-01-01T00:00:00Z',
+    targets: {
+      'app-2.0.0.bin': { length: 2048, hashes: { sha256: h.digestOf('app-2.0.0-payload') } },
+    },
+  });
+  h.addSignature(delegated, D1);
+  h.addSignature(delegated, D2);
+
+  return {
+    name: 'delegated-target',
+    title: '委托目标',
+    keys: { A, B, Ta, D1, D2, D3 },
+    input: {
+      reviewTime: REVIEW_TIME,
+      roots: [h.toText(v1)],
+      targets: h.toText(targets),
+      targetName: 'app-2.0.0.bin',
+      delegatedTargets: h.toText(delegated),
+    },
+  };
+}
+
+export const scenarioBuilders = [buildLegitRotation, buildOldRootOnly, buildExpiredTargets, buildDelegatedTarget];

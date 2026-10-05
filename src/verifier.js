@@ -5,7 +5,10 @@
 //  - 密钥标识 = 规范公钥对象的 SHA-256（hex）；仅接受 Ed25519；
 //  - Root 链按版本连续（v, v+1, ...）导入，首份为锚点（链外信任）；
 //  - 候选根须同时获得「前一 Root 的 root 角色」与「自身 root 角色」足额不同签名授权；
-//  - 最终 Targets 须由最终根的 targets 角色足额签名且未过期（审查时刻晚于过期时间即拒绝）。
+//  - 最终 Targets 须由最终根的 targets 角色足额签名且未过期（审查时刻晚于过期时间即拒绝）；
+//  - 录入目标名时追加目标级复核：顶层 Targets 的委托按声明顺序匹配目标名，
+//    命中的 terminating 委托失败（签名/格式/过期/目标缺失）即停止并拒绝，
+//    未终止委托失败才可回落检查顶层目标；子元数据只能由该委托声明的键与阈值授权。
 
 import { canonicalize, parseJsonStrict, MetadataParseError } from './canonical-json.js';
 import { sha256Hex, ed25519Verify, hexToBytes } from './crypto-adapter.js';
@@ -198,25 +201,10 @@ async function verifySignatures({ signedObj, signatures, keyLookup, thresholdSet
 
 // ---------- Targets 阶段 ----------
 
-async function verifyTargetsStage(trusted, targetsText, reviewMs) {
-  const stage = { stage: 'targets', status: 'rejected', signers: [], required: trusted.targetsRole.threshold };
-  let doc;
-  try {
-    doc = parseJsonStrict(targetsText);
-  } catch (err) {
-    stage.evidence = parseEvidence(err);
-    return stage;
-  }
-  const common = validateCommonSigned(doc, 'targets');
-  if (common.error) {
-    stage.evidence = common.error;
-    return stage;
-  }
-  const { signed } = common;
-  const targetsMap = signed.targets ?? {};
+// 校验 targets 映射中每个目标的元数据形态（length / hashes）。
+function validateTargetsMap(targetsMap) {
   if (!targetsMap || typeof targetsMap !== 'object' || Array.isArray(targetsMap)) {
-    stage.evidence = evidence('INVALID_METADATA', 'targets 必须是对象');
-    return stage;
+    return evidence('INVALID_METADATA', 'targets 必须是对象');
   }
   for (const [name, meta] of Object.entries(targetsMap)) {
     const bad =
@@ -228,10 +216,33 @@ async function verifyTargetsStage(trusted, targetsText, reviewMs) {
       typeof meta.hashes !== 'object' ||
       Array.isArray(meta.hashes);
     if (bad) {
-      stage.evidence = evidence('INVALID_METADATA', `目标 ${JSON.stringify(name)} 的元数据无效`);
-      return stage;
+      return evidence('INVALID_METADATA', `目标 ${JSON.stringify(name)} 的元数据无效`);
     }
   }
+  return null;
+}
+
+async function verifyTargetsStage(trusted, targetsText, reviewMs) {
+  const stage = { stage: 'targets', status: 'rejected', signers: [], required: trusted.targetsRole.threshold };
+  let doc;
+  try {
+    doc = parseJsonStrict(targetsText);
+  } catch (err) {
+    stage.evidence = parseEvidence(err);
+    return { stage };
+  }
+  const common = validateCommonSigned(doc, 'targets');
+  if (common.error) {
+    stage.evidence = common.error;
+    return { stage };
+  }
+  const { signed } = common;
+  const mapError = validateTargetsMap(signed.targets ?? {});
+  if (mapError) {
+    stage.evidence = mapError;
+    return { stage };
+  }
+  const targetsMap = signed.targets ?? {};
   stage.version = signed.version;
   stage.expires = signed.expires;
   stage.targetNames = Object.keys(targetsMap).sort();
@@ -246,7 +257,7 @@ async function verifyTargetsStage(trusted, targetsText, reviewMs) {
   });
   if (sigResult.error) {
     stage.evidence = sigResult.error;
-    return stage;
+    return { stage };
   }
   stage.signers = sigResult.value.targets.signers;
   if (stage.signers.length < trusted.targetsRole.threshold) {
@@ -254,7 +265,7 @@ async function verifyTargetsStage(trusted, targetsText, reviewMs) {
       required: trusted.targetsRole.threshold,
       got: stage.signers.length,
     });
-    return stage;
+    return { stage };
   }
   // 审查时刻晚于过期时间即拒绝，即使签名有效
   stage.expired = reviewMs > Date.parse(signed.expires);
@@ -262,8 +273,238 @@ async function verifyTargetsStage(trusted, targetsText, reviewMs) {
     stage.evidence = evidence('TARGETS_EXPIRED', '审查时刻晚于最终 Targets 的过期时间，不予授权', {
       expires: signed.expires,
     });
+    return { stage };
+  }
+  stage.status = 'accepted';
+  return { stage, signed };
+}
+
+// ---------- 目标级复核（委托） ----------
+
+// 路径规则：`*` 匹配任意字符序列（含 `/`），`?` 匹配任意单个字符，其余字符按字面匹配。
+function matchPathPattern(pattern, name) {
+  let src = '';
+  for (const ch of pattern) {
+    if (ch === '*') src += '.*';
+    else if (ch === '?') src += '.';
+    else src += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${src}$`, 'su').test(name);
+}
+
+// 校验顶层 Targets 声明的 delegations：键仅接受 Ed25519，角色名不得重复，
+// 阈值/keyids/terminating 形态合法，路径规则必须是非空字符串组成的非空数组。
+async function buildDelegations(signed) {
+  const deleg = signed.delegations;
+  if (deleg === undefined || deleg === null) return { value: null };
+  if (typeof deleg !== 'object' || Array.isArray(deleg)) {
+    return { error: evidence('INVALID_METADATA', 'delegations 必须是对象') };
+  }
+  if (!deleg.keys || typeof deleg.keys !== 'object' || Array.isArray(deleg.keys)) {
+    return { error: evidence('INVALID_METADATA', 'delegations.keys 必须是对象') };
+  }
+  const keys = await buildKeyMap(Object.values(deleg.keys));
+  if (keys.error) return keys;
+  if (!Array.isArray(deleg.roles) || deleg.roles.length === 0) {
+    return { error: evidence('INVALID_METADATA', 'delegations.roles 必须是非空数组') };
+  }
+  const roles = [];
+  const seenNames = new Set();
+  for (const item of deleg.roles) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return { error: evidence('INVALID_METADATA', '委托角色必须是对象') };
+    }
+    const name = item.name;
+    if (typeof name !== 'string' || name === '') {
+      return { error: evidence('INVALID_METADATA', '委托角色名必须是非空字符串') };
+    }
+    if (seenNames.has(name)) {
+      return {
+        error: evidence('DUPLICATE_DELEGATION_ROLE', `重复委托角色：${JSON.stringify(name)}`, { role: name }),
+      };
+    }
+    seenNames.add(name);
+    if (!Number.isInteger(item.threshold) || item.threshold < 1) {
+      return { error: evidence('INVALID_METADATA', `委托角色 ${JSON.stringify(name)} 的阈值必须是 ≥1 的整数`) };
+    }
+    if (!Array.isArray(item.keyids) || item.keyids.length === 0) {
+      return { error: evidence('INVALID_METADATA', `委托角色 ${JSON.stringify(name)} 的 keyids 必须是非空数组`) };
+    }
+    const keyids = [...new Set(item.keyids)];
+    for (const keyid of keyids) {
+      if (typeof keyid !== 'string' || !keys.map.has(keyid)) {
+        return {
+          error: evidence('UNKNOWN_ROLE_KEY', `委托角色 ${JSON.stringify(name)} 引用了未知键`, {
+            role: name,
+            keyid: String(keyid),
+          }),
+        };
+      }
+    }
+    if (typeof item.terminating !== 'boolean') {
+      return { error: evidence('INVALID_METADATA', `委托角色 ${JSON.stringify(name)} 的 terminating 必须是布尔值`) };
+    }
+    if (!Array.isArray(item.paths) || item.paths.length === 0) {
+      return {
+        error: evidence('INVALID_PATH_PATTERN', `委托角色 ${JSON.stringify(name)} 的 paths 必须是非空数组`, {
+          role: name,
+        }),
+      };
+    }
+    for (const pattern of item.paths) {
+      if (typeof pattern !== 'string' || pattern === '') {
+        return {
+          error: evidence('INVALID_PATH_PATTERN', `委托角色 ${JSON.stringify(name)} 含非法路径规则`, {
+            role: name,
+            pattern: String(pattern),
+          }),
+        };
+      }
+    }
+    roles.push({ name, keyids, threshold: item.threshold, terminating: item.terminating, paths: [...item.paths] });
+  }
+  return { value: { keyMap: keys.map, roles } };
+}
+
+// 子元数据只能由该委托声明的 Ed25519 键与阈值授权；过期与目标缺失同样构成失败。
+async function verifyDelegatedTarget({ role, keyMap, delegatedText, targetName, reviewMs }) {
+  if (typeof delegatedText !== 'string' || delegatedText.trim() === '') {
+    return {
+      error: evidence('MISSING_DELEGATED_METADATA', `命中委托角色 ${JSON.stringify(role.name)}，但未提供受委托 Targets 元数据`, {
+        role: role.name,
+      }),
+    };
+  }
+  let doc;
+  try {
+    doc = parseJsonStrict(delegatedText);
+  } catch (err) {
+    return { error: parseEvidence(err) };
+  }
+  const common = validateCommonSigned(doc, 'targets');
+  if (common.error) return common;
+  const { signed } = common;
+  const targetsMap = signed.targets ?? {};
+  const mapError = validateTargetsMap(targetsMap);
+  if (mapError) return { error: mapError };
+
+  const sigResult = await verifySignatures({
+    signedObj: signed,
+    signatures: doc.signatures,
+    keyLookup: keyMap,
+    thresholdSets: [{ name: role.name, keyids: role.keyids, threshold: role.threshold }],
+  });
+  if (sigResult.error) return { error: sigResult.error };
+  const signers = sigResult.value[role.name].signers;
+  if (signers.length < role.threshold) {
+    return {
+      error: evidence('DELEGATION_THRESHOLD_NOT_MET', `签名不足：委托角色 ${JSON.stringify(role.name)} 未达阈值`, {
+        role: role.name,
+        required: role.threshold,
+        got: signers.length,
+      }),
+    };
+  }
+  if (reviewMs > Date.parse(signed.expires)) {
+    return {
+      error: evidence('DELEGATION_EXPIRED', `审查时刻晚于委托角色 ${JSON.stringify(role.name)} 元数据的过期时间`, {
+        role: role.name,
+        expires: signed.expires,
+      }),
+    };
+  }
+  const meta = targetsMap[targetName];
+  if (!meta) {
+    return {
+      error: evidence('TARGET_NOT_FOUND', `委托角色 ${JSON.stringify(role.name)} 的元数据中不存在目标 ${JSON.stringify(targetName)}`, {
+        role: role.name,
+        target: targetName,
+      }),
+    };
+  }
+  return {
+    value: {
+      signers,
+      version: signed.version,
+      expires: signed.expires,
+      digest: { length: meta.length, hashes: meta.hashes },
+    },
+  };
+}
+
+// 目标级复核：委托按声明顺序匹配目标名；terminating 命中后失败即停止并拒绝
+// （顶层同名摘要不得当作允许证据），未终止委托失败才回落检查顶层目标。
+async function verifyTargetCheck({ trusted, targetsStage, targetsSigned, targetName, delegatedText, reviewMs }) {
+  const stage = {
+    stage: 'target-check',
+    status: 'rejected',
+    targetName,
+    role: null,
+    matchedPath: null,
+    terminating: null,
+    signers: [],
+    required: null,
+    digest: null,
+  };
+  const deleg = await buildDelegations(targetsSigned);
+  if (deleg.error) {
+    stage.evidence = deleg.error;
     return stage;
   }
+
+  let matchedRole = null;
+  let matchedPattern = null;
+  if (deleg.value) {
+    for (const role of deleg.value.roles) {
+      const hit = role.paths.find((pattern) => matchPathPattern(pattern, targetName));
+      if (hit !== undefined) {
+        matchedRole = role;
+        matchedPattern = hit;
+        break;
+      }
+    }
+  }
+
+  if (matchedRole) {
+    stage.matchedPath = matchedPattern;
+    stage.terminating = matchedRole.terminating;
+    const sub = await verifyDelegatedTarget({
+      role: matchedRole,
+      keyMap: deleg.value.keyMap,
+      delegatedText,
+      targetName,
+      reviewMs,
+    });
+    if (!sub.error) {
+      stage.role = matchedRole.name;
+      stage.required = matchedRole.threshold;
+      stage.signers = sub.value.signers;
+      stage.digest = sub.value.digest;
+      stage.delegatedVersion = sub.value.version;
+      stage.delegatedExpires = sub.value.expires;
+      stage.status = 'accepted';
+      return stage;
+    }
+    if (matchedRole.terminating) {
+      stage.role = matchedRole.name;
+      stage.evidence = sub.error;
+      return stage;
+    }
+    // 未终止委托失败：保留失败痕迹后继续检查顶层目标
+    stage.delegationAttempt = { role: matchedRole.name, failure: sub.error };
+  }
+
+  const meta = (targetsSigned.targets ?? {})[targetName];
+  if (!meta) {
+    stage.evidence = evidence('TARGET_NOT_FOUND', `目标缺失：${JSON.stringify(targetName)} 未获任何有效角色授权`, {
+      target: targetName,
+    });
+    return stage;
+  }
+  stage.role = 'targets';
+  stage.required = trusted.targetsRole.threshold;
+  stage.signers = targetsStage.signers;
+  stage.digest = { length: meta.length, hashes: meta.hashes };
   stage.status = 'accepted';
   return stage;
 }
@@ -277,18 +518,20 @@ function inputFailure(code, message) {
     finalRootVersion: null,
     rounds: [],
     targets: null,
+    targetCheck: null,
     evidence: evidence(code, message),
     summary: { finalRootVersion: null, reason: { code, message } },
   };
 }
 
-function failure(rounds, trusted, targetsStage, ev) {
+function failure(rounds, trusted, targetsStage, ev, targetCheckStage = null) {
   return {
     ok: false,
     conclusion: 'REJECT',
     finalRootVersion: trusted ? trusted.version : null,
     rounds,
     targets: targetsStage ?? null,
+    targetCheck: targetCheckStage,
     evidence: ev,
     summary: { finalRootVersion: trusted ? trusted.version : null, reason: ev },
   };
@@ -300,6 +543,12 @@ export async function verifyReview(input) {
     ? input.roots.filter((t) => typeof t === 'string' && t.trim() !== '')
     : [];
   const targetsText = input?.targets;
+  // 目标级复核的可选录入：目标名 + 受委托 Targets 元数据
+  const targetName =
+    typeof input?.targetName === 'string' && input.targetName.trim() !== ''
+      ? input.targetName.trim()
+      : null;
+  const delegatedText = typeof input?.delegatedTargets === 'string' ? input.delegatedTargets : '';
 
   const reviewMs = Date.parse(reviewTime);
   if (!Number.isFinite(reviewMs)) return inputFailure('INVALID_REVIEW_TIME', '审查时刻无效');
@@ -407,9 +656,43 @@ export async function verifyReview(input) {
   }
 
   // Targets 阶段：须由最终根的 targets 角色足额签名且未过期
-  const targetsStage = await verifyTargetsStage(trusted, targetsText, reviewMs);
+  const { stage: targetsStage, signed: targetsSigned } = await verifyTargetsStage(trusted, targetsText, reviewMs);
   if (targetsStage.status !== 'accepted') {
     return failure(rounds, trusted, targetsStage, targetsStage.evidence);
+  }
+
+  // 目标级复核（可选）：判断具体目标应由顶层 targets 还是获委托角色发布
+  let targetCheckStage = null;
+  if (targetName !== null) {
+    targetCheckStage = await verifyTargetCheck({
+      trusted,
+      targetsStage,
+      targetsSigned,
+      targetName,
+      delegatedText,
+      reviewMs,
+    });
+    if (targetCheckStage.status !== 'accepted') {
+      return failure(rounds, trusted, targetsStage, targetCheckStage.evidence, targetCheckStage);
+    }
+  }
+
+  const summary = {
+    finalRootVersion: trusted.version,
+    targetsVersion: targetsStage.version,
+    targetsExpires: targetsStage.expires,
+    targetsSigners: targetsStage.signers,
+    targetNames: targetsStage.targetNames,
+    targetCount: targetsStage.targetNames.length,
+  };
+  if (targetCheckStage) {
+    summary.targetCheck = {
+      targetName: targetCheckStage.targetName,
+      role: targetCheckStage.role,
+      matchedPath: targetCheckStage.matchedPath,
+      signers: targetCheckStage.signers,
+      digest: targetCheckStage.digest,
+    };
   }
   return {
     ok: true,
@@ -417,13 +700,7 @@ export async function verifyReview(input) {
     finalRootVersion: trusted.version,
     rounds,
     targets: targetsStage,
-    summary: {
-      finalRootVersion: trusted.version,
-      targetsVersion: targetsStage.version,
-      targetsExpires: targetsStage.expires,
-      targetsSigners: targetsStage.signers,
-      targetNames: targetsStage.targetNames,
-      targetCount: targetsStage.targetNames.length,
-    },
+    targetCheck: targetCheckStage,
+    summary,
   };
 }

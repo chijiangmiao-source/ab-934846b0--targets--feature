@@ -39,15 +39,19 @@ function collectInput() {
     reviewTime: $('review-time').value.trim(),
     roots,
     targets: $('targets-input').value.trim(),
+    targetName: $('target-name').value.trim(),
+    delegatedTargets: $('delegated-input').value.trim(),
   };
 }
 
-function fillInput({ reviewTime, roots, targets }) {
+function fillInput({ reviewTime, roots, targets, targetName, delegatedTargets }) {
   $('review-time').value = reviewTime ?? '';
   for (let i = 0; i < MAX_ROOTS; i++) {
     $(`root-${i}`).value = roots?.[i] ?? '';
   }
   $('targets-input').value = targets ?? '';
+  $('target-name').value = targetName ?? '';
+  $('delegated-input').value = delegatedTargets ?? '';
 }
 
 // ---------- Worker ----------
@@ -162,6 +166,57 @@ function renderTargetsStage(targets) {
   container.appendChild(card);
 }
 
+function digestBlock(digest) {
+  const box = el('div', 'digest');
+  box.appendChild(el('p', 'note', `目标摘要：length ${digest.length} 字节`));
+  const list = el('ul', 'target-list');
+  for (const [algo, value] of Object.entries(digest.hashes ?? {})) {
+    list.appendChild(el('li', null, `${algo}: ${value}`));
+  }
+  box.appendChild(list);
+  return box;
+}
+
+function renderTargetCheck(targetCheck) {
+  const container = $('target-check');
+  container.replaceChildren();
+  if (!targetCheck) {
+    container.appendChild(el('p', 'note', '未执行：未录入目标名，仅复核顶层 Targets。'));
+    return;
+  }
+  const card = el('div', `card ${targetCheck.status}`);
+  const head = el('div', 'card-head');
+  head.appendChild(el('strong', null, `目标 ${targetCheck.targetName}`));
+  head.appendChild(statusBadge(targetCheck.status === 'accepted', '通过', '拒绝'));
+  card.appendChild(head);
+  if (targetCheck.role) {
+    const roleText =
+      targetCheck.role === 'targets' ? 'targets（顶层）' : `${targetCheck.role}（获委托角色）`;
+    card.appendChild(el('p', 'note', `实际采用角色：${roleText}`));
+  }
+  if (targetCheck.matchedPath !== null && targetCheck.matchedPath !== undefined) {
+    const term =
+      targetCheck.terminating === true ? 'terminating（失败即停止）' : '非终止（失败可回落顶层）';
+    card.appendChild(el('p', 'note', `命中的路径规则：${targetCheck.matchedPath} · ${term}`));
+  } else {
+    card.appendChild(el('p', 'note', '命中的路径规则：无（未命中任何委托，直接由顶层 targets 授权）'));
+  }
+  if (targetCheck.delegationAttempt) {
+    const attempt = targetCheck.delegationAttempt;
+    card.appendChild(
+      el('p', 'note', `委托角色 ${attempt.role} 校验失败（${attempt.failure.code}），非终止委托，已继续检查顶层目标。`)
+    );
+  }
+  if (targetCheck.required !== null && targetCheck.required !== undefined) {
+    card.appendChild(
+      signerLine('达阈值的不同签名者', { required: targetCheck.required, signers: targetCheck.signers ?? [] })
+    );
+  }
+  if (targetCheck.digest) card.appendChild(digestBlock(targetCheck.digest));
+  if (targetCheck.evidence) card.appendChild(evidenceBlock(targetCheck.evidence));
+  container.appendChild(card);
+}
+
 function renderConclusion(result) {
   const container = $('conclusion');
   container.replaceChildren();
@@ -175,9 +230,19 @@ function renderConclusion(result) {
   );
   if (result.ok) {
     const summary = result.summary;
-    card.appendChild(
-      el('p', 'note', `最终允许的目标摘要：Targets v${summary.targetsVersion}，共 ${summary.targetCount} 个目标（${summary.targetNames.join('、') || '无'}）`)
-    );
+    if (summary.targetCheck) {
+      const check = summary.targetCheck;
+      const hashes = Object.entries(check.digest?.hashes ?? {})
+        .map(([algo, value]) => `${algo}: ${value}`)
+        .join('，');
+      card.appendChild(
+        el('p', 'note', `最终允许的目标摘要：角色 ${check.role} 授权目标「${check.targetName}」（${hashes}，${check.digest?.length} 字节）`)
+      );
+    } else {
+      card.appendChild(
+        el('p', 'note', `最终允许的目标摘要：Targets v${summary.targetsVersion}，共 ${summary.targetCount} 个目标（${summary.targetNames.join('、') || '无'}）`)
+      );
+    }
   } else if (result.evidence) {
     card.appendChild(evidenceBlock(result.evidence));
   }
@@ -187,6 +252,7 @@ function renderConclusion(result) {
 function renderResult(result) {
   renderRounds(result.rounds);
   renderTargetsStage(result.targets);
+  renderTargetCheck(result.targetCheck);
   renderConclusion(result);
   $('result-panel').hidden = false;
   $('error-panel').hidden = true;

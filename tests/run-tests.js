@@ -11,6 +11,7 @@ import {
   buildLegitRotation,
   buildOldRootOnly,
   buildExpiredTargets,
+  buildDelegatedTarget,
 } from './scenarios.js';
 
 function assert(cond, msg) {
@@ -76,6 +77,7 @@ test('合法轮换：双阈值逐轮达成，最终允许并给出目标摘要',
   assertEq(result.targets.signers.length, 1);
   assert(result.summary.targetNames.includes('app-1.0.0.bin'), '目标摘要应包含目标文件名');
   assertEq(result.summary.targetCount, 1);
+  assertEq(result.targetCheck, null, '未录入目标名时不执行目标级复核');
 });
 
 test('旧根单签拒绝：仅旧根达阈值，保留此前可信根', async () => {
@@ -293,6 +295,175 @@ test('录入校验：缺少审查时刻 / Root / Targets 即拒绝', async () =>
   assertEq((await verifyReview({ ...input, reviewTime: 'not-a-time' })).evidence.code, 'INVALID_REVIEW_TIME');
   assertEq((await verifyReview({ ...input, roots: [] })).evidence.code, 'NO_ROOTS');
   assertEq((await verifyReview({ ...input, targets: '' })).evidence.code, 'NO_TARGETS');
+});
+
+// ---------- 目标级复核（委托） ----------
+
+test('委托目标：terminating 委托命中并足额签名，允许并给出角色/路径/签名者/摘要', async () => {
+  const { input } = buildDelegatedTarget();
+  const result = await verifyReview(input);
+  assert(result.ok, `应允许：${JSON.stringify(result.evidence)}`);
+  assertEq(result.targetCheck.status, 'accepted');
+  assertEq(result.targetCheck.role, 'frontend', '实际采用角色应为命中的委托角色');
+  assertEq(result.targetCheck.matchedPath, 'app-*', '应命中委托声明的路径规则');
+  assertEq(result.targetCheck.terminating, true);
+  assertEq(result.targetCheck.signers.length, 2, '达阈值的不同签名者');
+  assertEq(result.targetCheck.digest.length, 2048);
+  assertEq(result.targetCheck.digest.hashes.sha256, h.digestOf('app-2.0.0-payload'));
+  assertEq(result.summary.targetCheck.role, 'frontend');
+  assertEq(result.summary.targetCheck.matchedPath, 'app-*');
+  assertEq(result.summary.targetCheck.signers.length, 2);
+});
+
+test('委托顺序：按声明顺序匹配目标名，首个命中角色生效', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  // 'misc-note.txt' 不匹配 app-*，落到第二个角色 misc（路径 *）
+  const miscDoc = h.makeTargets({
+    version: 1,
+    targets: { 'misc-note.txt': { length: 5, hashes: { sha256: h.digestOf('misc') } } },
+  });
+  h.addSignature(miscDoc, keys.D3);
+  const result = await verifyReview({
+    ...input,
+    targetName: 'misc-note.txt',
+    delegatedTargets: h.toText(miscDoc),
+  });
+  assert(result.ok, `应允许：${JSON.stringify(result.evidence)}`);
+  assertEq(result.targetCheck.role, 'misc');
+  assertEq(result.targetCheck.matchedPath, '*');
+  assertEq(result.targetCheck.signers.length, 1);
+  // 而 'app-2.0.0.bin' 同时匹配 app-* 与 *，首个命中的 frontend 生效
+  assertEq((await verifyReview(input)).targetCheck.role, 'frontend');
+});
+
+test('terminating 委托失败即停止：顶层同名摘要不得当作允许证据', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  // 顶层 Targets 也列出同名目标（重新签名使其自身合法），但不提供子元数据
+  const targetsDoc = JSON.parse(input.targets);
+  targetsDoc.signed.targets['app-2.0.0.bin'] = { length: 1, hashes: { sha256: h.digestOf('fake') } };
+  targetsDoc.signatures = [];
+  h.addSignature(targetsDoc, keys.Ta);
+  const result = await verifyReview({
+    ...input,
+    targets: h.toText(targetsDoc),
+    delegatedTargets: '',
+  });
+  assert(!result.ok, '命中 terminating 委托且子元数据缺失，应拒绝');
+  assertEq(result.targetCheck.evidence.code, 'MISSING_DELEGATED_METADATA');
+  assertEq(result.targetCheck.role, 'frontend');
+  assertEq(result.finalRootVersion, 1, '应保留既有根轮次证据');
+  assertEq(result.rounds.length, 1);
+  assertEq(result.targets.status, 'accepted', '顶层 Targets 本身合法，阻断发生在目标级复核');
+});
+
+test('terminating 委托签名不足：不得回落顶层目标', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  const targetsDoc = JSON.parse(input.targets);
+  targetsDoc.signed.targets['app-2.0.0.bin'] = { length: 1, hashes: { sha256: h.digestOf('fake') } };
+  targetsDoc.signatures = [];
+  h.addSignature(targetsDoc, keys.Ta);
+  const delegatedDoc = JSON.parse(input.delegatedTargets);
+  delegatedDoc.signatures = delegatedDoc.signatures.slice(0, 1); // 阈值 2，仅 1 签
+  const result = await verifyReview({
+    ...input,
+    targets: h.toText(targetsDoc),
+    delegatedTargets: JSON.stringify(delegatedDoc),
+  });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.targetCheck.evidence.code, 'DELEGATION_THRESHOLD_NOT_MET');
+  assertEq(result.targetCheck.evidence.required, 2);
+  assertEq(result.targetCheck.evidence.got, 1);
+});
+
+test('无权子元数据：子元数据只能由委托声明的键授权', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  // 用顶层 targets 角色的键（而非 frontend 委托声明的 D1/D2）签署子元数据
+  const delegatedDoc = JSON.parse(input.delegatedTargets);
+  delegatedDoc.signatures = [];
+  h.addSignature(delegatedDoc, keys.Ta);
+  const result = await verifyReview({ ...input, delegatedTargets: h.toText(delegatedDoc) });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.targetCheck.evidence.code, 'UNKNOWN_KEY');
+});
+
+test('未终止委托失败可回落：顶层目标仍可授权', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  // base.txt 命中非终止角色 misc（路径 *）；提供由 D3 签署但不含该目标的子元数据
+  const miscDoc = h.makeTargets({
+    version: 1,
+    targets: { 'other.txt': { length: 3, hashes: { sha256: h.digestOf('other') } } },
+  });
+  h.addSignature(miscDoc, keys.D3);
+  const result = await verifyReview({
+    ...input,
+    targetName: 'base.txt',
+    delegatedTargets: h.toText(miscDoc),
+  });
+  assert(result.ok, `非终止委托失败应回落顶层：${JSON.stringify(result.evidence)}`);
+  assertEq(result.targetCheck.role, 'targets', '实际采用角色应回落为顶层 targets');
+  assertEq(result.targetCheck.matchedPath, '*');
+  assertEq(result.targetCheck.delegationAttempt.role, 'misc');
+  assertEq(result.targetCheck.delegationAttempt.failure.code, 'TARGET_NOT_FOUND');
+  assertEq(result.targetCheck.digest.length, 10);
+});
+
+test('目标缺失：顶层与命中委托均未授权该目标即拒绝', async () => {
+  const { input } = buildDelegatedTarget();
+  const result = await verifyReview({ ...input, targetName: 'no-such-file.bin', delegatedTargets: '' });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.targetCheck.evidence.code, 'TARGET_NOT_FOUND');
+  assertEq(result.finalRootVersion, 1, '应保留既有根轮次证据');
+  assertEq(result.rounds[0].status, 'trusted');
+});
+
+test('重复委托角色：delegations 中角色名重复即拒绝', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  const targetsDoc = JSON.parse(input.targets);
+  const roles = targetsDoc.signed.delegations.roles;
+  roles.push({ ...roles[0] }); // 重复的 frontend 角色
+  targetsDoc.signatures = [];
+  h.addSignature(targetsDoc, keys.Ta);
+  const result = await verifyReview({ ...input, targets: h.toText(targetsDoc) });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.targetCheck.evidence.code, 'DUPLICATE_DELEGATION_ROLE');
+  assertEq(result.finalRootVersion, 1);
+});
+
+test('非法路径规则：空路径串或空 paths 数组即拒绝', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  for (const paths of [[''], []]) {
+    const targetsDoc = JSON.parse(input.targets);
+    targetsDoc.signed.delegations.roles[0].paths = paths;
+    targetsDoc.signatures = [];
+    h.addSignature(targetsDoc, keys.Ta);
+    const result = await verifyReview({ ...input, targets: h.toText(targetsDoc) });
+    assert(!result.ok, `paths=${JSON.stringify(paths)} 应拒绝`);
+    assertEq(result.targetCheck.evidence.code, 'INVALID_PATH_PATTERN');
+    assertEq(result.finalRootVersion, 1, '应保留既有根轮次证据');
+  }
+});
+
+test('委托子元数据过期：terminating 命中后过期校验失败即拒绝', async () => {
+  const { input, keys } = buildDelegatedTarget();
+  const delegatedDoc = JSON.parse(input.delegatedTargets);
+  delegatedDoc.signed.expires = '2026-06-01T00:00:00Z';
+  delegatedDoc.signatures = [];
+  h.addSignature(delegatedDoc, keys.D1);
+  h.addSignature(delegatedDoc, keys.D2);
+  const result = await verifyReview({ ...input, delegatedTargets: h.toText(delegatedDoc) });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.targetCheck.evidence.code, 'DELEGATION_EXPIRED');
+});
+
+test('无委托时目标名命中顶层：由 targets 角色授权，无路径规则', async () => {
+  const { input } = buildLegitRotation();
+  const result = await verifyReview({ ...input, targetName: 'app-1.0.0.bin' });
+  assert(result.ok, `应允许：${JSON.stringify(result.evidence)}`);
+  assertEq(result.targetCheck.role, 'targets');
+  assertEq(result.targetCheck.matchedPath, null);
+  assertEq(result.targetCheck.signers.length, 1);
+  assertEq(result.targetCheck.digest.length, 4096);
+  assertEq(result.summary.targetCheck.role, 'targets');
 });
 
 // ---------- 运行器 ----------

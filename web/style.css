@@ -153,6 +153,8 @@ button:disabled { opacity: 0.5; cursor: wait; }
 
 .target-list { margin: 4px 0; padding-left: 20px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
 
+.digest { margin: 6px 0; word-break: break-all; }
+
 #error-text {
   background: var(--bad-bg);
   border-radius: 6px;

@@ -73,3 +73,6 @@ export function makeTargets({ version = 1, expires = '2030-01-01T00:00:00Z', tar
 
 // 页面录入的是原始文本，签名只覆盖规范形式，排版空白不影响验签
 export const toText = (metadata) => JSON.stringify(metadata, null, 2);
+
+// 构造目标摘要用的确定摘要值
+export const digestOf = (text) => createHash('sha256').update(text).digest('hex');
