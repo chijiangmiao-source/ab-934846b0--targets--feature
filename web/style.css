@@ -105,6 +105,7 @@ button:disabled { opacity: 0.5; cursor: wait; }
 }
 .badge.ok { color: var(--ok); background: var(--ok-bg); }
 .badge.bad { color: var(--bad); background: var(--bad-bg); }
+.badge.neutral { color: var(--muted); background: #eef2f6; }
 
 .note { color: var(--muted); font-size: 13px; margin: 6px 0; }
 
@@ -152,6 +153,41 @@ button:disabled { opacity: 0.5; cursor: wait; }
 .evidence-msg { color: var(--ink); }
 
 .target-list { margin: 4px 0; padding-left: 20px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+
+.strong-note { color: var(--ink); font-weight: 600; margin-top: 12px; }
+
+.delegation { margin-top: 10px; }
+
+.deleg-row {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  background: #fff;
+}
+.deleg-row.accepted { border-left-color: var(--ok); }
+.deleg-row.rejected { border-left-color: var(--bad); }
+.deleg-row.skipped, .deleg-row.missing { border-left-color: var(--muted); opacity: 0.92; }
+
+.deleg-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.deleg-name { font-weight: 600; font-size: 13.5px; }
+
+.resolution {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--ok-bg);
+  border: 1px solid var(--ok);
+}
+.resolution .digest-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chip.digest { font-size: 12px; padding: 1px 8px; }
 
 #error-text {
   background: var(--bad-bg);

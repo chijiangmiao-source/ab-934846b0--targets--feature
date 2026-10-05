@@ -141,4 +141,114 @@ export function buildExpiredTargets() {
   };
 }
 
-export const scenarioBuilders = [buildLegitRotation, buildOldRootOnly, buildExpiredTargets];
+// 受委托目标允许：Root 链与顶层 Targets 通过后，目标 pkg/app-2.0.0.bin 只能由
+// 命中路径规则的委托角色 pkg（threshold 2）发布；实际采用角色与摘要来自子元数据。
+export function buildDelegatedTarget() {
+  const A = h.genKey('A');
+  const B = h.genKey('B');
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const D2 = h.genKey('D2');
+
+  const v1 = h.makeRoot({
+    version: 1,
+    keys: [A, B, Ta],
+    rootKeys: [A, B],
+    rootThreshold: 2,
+    targetsKeys: [Ta],
+    targetsThreshold: 1,
+  });
+  h.addSignature(v1, A);
+  h.addSignature(v1, B);
+
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    version: 1,
+    expires: '2030-01-01T00:00:00Z',
+    targets: { 'other.txt': h.targetMeta('top-level-only') },
+    delegations: h.delegationsOf([D1, D2], [
+      h.delegationRole('pkg', [D1, D2], { threshold: 2, paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+
+  const delegated = h.makeDelegatedTargets({
+    version: 1,
+    expires: '2030-01-01T00:00:00Z',
+    targets: { [targetName]: h.targetMeta('delegated-payload') },
+  });
+  h.addSignature(delegated, D1);
+  h.addSignature(delegated, D2);
+
+  return {
+    name: 'delegated-target',
+    title: '委托目标授权',
+    input: {
+      reviewTime: REVIEW_TIME,
+      roots: [h.toText(v1)],
+      targets: h.toText(targets),
+      targetName,
+      delegatedTargets: h.toText(delegated),
+    },
+  };
+}
+
+// 终止性委托失败拒绝：目标命中 terminating 委托，但子元数据签名未达阈值；
+// 即使顶层 Targets 含同名目标摘要，也必须停止并拒绝，不得把顶层同名条目当作允许证据。
+export function buildDelegatedTerminatingFailure() {
+  const A = h.genKey('A');
+  const B = h.genKey('B');
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const D2 = h.genKey('D2');
+
+  const v1 = h.makeRoot({
+    version: 1,
+    keys: [A, B, Ta, D1, D2],
+    rootKeys: [A, B],
+    rootThreshold: 2,
+    targetsKeys: [Ta],
+    targetsThreshold: 1,
+  });
+  h.addSignature(v1, A);
+  h.addSignature(v1, B);
+
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    version: 1,
+    expires: '2030-01-01T00:00:00Z',
+    // 顶层同名摘要（诱饵）：terminating 命中失败时不得采用
+    targets: { [targetName]: h.targetMeta('top-level-decoy') },
+    delegations: h.delegationsOf([D1, D2], [
+      h.delegationRole('pkg', [D1, D2], { threshold: 2, paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+
+  const delegated = h.makeDelegatedTargets({
+    version: 1,
+    expires: '2030-01-01T00:00:00Z',
+    targets: { [targetName]: h.targetMeta('delegated-payload') },
+  });
+  h.addSignature(delegated, D1); // 阈值 2，仅 1 签
+
+  return {
+    name: 'delegated-terminating-failure',
+    title: '终止委托失败拒绝',
+    input: {
+      reviewTime: REVIEW_TIME,
+      roots: [h.toText(v1)],
+      targets: h.toText(targets),
+      targetName,
+      delegatedTargets: h.toText(delegated),
+    },
+  };
+}
+
+export const scenarioBuilders = [
+  buildLegitRotation,
+  buildOldRootOnly,
+  buildExpiredTargets,
+  buildDelegatedTarget,
+  buildDelegatedTerminatingFailure,
+];

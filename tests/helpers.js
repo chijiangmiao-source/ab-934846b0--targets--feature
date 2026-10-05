@@ -53,23 +53,51 @@ export function makeRoot({
   };
 }
 
-export function makeTargets({ version = 1, expires = '2030-01-01T00:00:00Z', targets } = {}) {
+// 目标条目：length 与 sha256 均由内容派生（测试可传入字符串/Buffer）
+export function targetMeta(content) {
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
   return {
-    signed: {
-      _type: 'targets',
-      spec_version: '1.0.0',
-      version,
-      expires,
-      targets: targets ?? {
-        'app-1.0.0.bin': {
-          length: 4096,
-          hashes: { sha256: createHash('sha256').update('demo-payload').digest('hex') },
-        },
+    length: buf.length,
+    hashes: { sha256: createHash('sha256').update(buf).digest('hex') },
+  };
+}
+
+// 构造顶层 Targets 中 signed.delegations 字段（仅键对象与角色声明，无独立签名）
+export function delegationsOf(keys, roles) {
+  return { keys: keys.map(keyObjectOf), roles };
+}
+
+export function delegationRole(name, roleKeys, { threshold = roleKeys.length, paths, terminating = false } = {}) {
+  return { name, keyids: roleKeys.map(keyidOf), threshold, paths, terminating };
+}
+
+export function makeTargets({
+  version = 1,
+  expires = '2030-01-01T00:00:00Z',
+  targets,
+  delegations,
+} = {}) {
+  const signed = {
+    _type: 'targets',
+    spec_version: '1.0.0',
+    version,
+    expires,
+    targets: targets ?? {
+      'app-1.0.0.bin': {
+        length: 4096,
+        hashes: { sha256: createHash('sha256').update('demo-payload').digest('hex') },
       },
     },
+  };
+  if (delegations) signed.delegations = delegations;
+  return {
+    signed,
     signatures: [],
   };
 }
+
+// 受委托 Targets 与顶层 Targets 同构（_type 仍为 'targets'）
+export const makeDelegatedTargets = makeTargets;
 
 // 页面录入的是原始文本，签名只覆盖规范形式，排版空白不影响验签
 export const toText = (metadata) => JSON.stringify(metadata, null, 2);

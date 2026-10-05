@@ -1,6 +1,7 @@
 // 代码规则测试：覆盖规范 JSON、密钥标识、轮换双阈值、全部拒绝分支与过期规则。
 
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { verifyReview, MAX_ROOTS } from '../src/verifier.js';
 import { canonicalize, parseJsonStrict } from '../src/canonical-json.js';
@@ -11,6 +12,8 @@ import {
   buildLegitRotation,
   buildOldRootOnly,
   buildExpiredTargets,
+  buildDelegatedTarget,
+  buildDelegatedTerminatingFailure,
 } from './scenarios.js';
 
 function assert(cond, msg) {
@@ -293,6 +296,393 @@ test('录入校验：缺少审查时刻 / Root / Targets 即拒绝', async () =>
   assertEq((await verifyReview({ ...input, reviewTime: 'not-a-time' })).evidence.code, 'INVALID_REVIEW_TIME');
   assertEq((await verifyReview({ ...input, roots: [] })).evidence.code, 'NO_ROOTS');
   assertEq((await verifyReview({ ...input, targets: '' })).evidence.code, 'NO_TARGETS');
+});
+
+// ---------- 委托（delegations）与具体目标判定 ----------
+
+// 常见基底：v1 根（A/B 双签，targets 角色由 targetKeys 授权）
+function delegatedBase({ targetKeys, delegKeys, targetsThreshold = 1 }) {
+  const A = h.genKey('A');
+  const B = h.genKey('B');
+  const v1 = h.makeRoot({
+    version: 1,
+    keys: [A, B, ...targetKeys, ...delegKeys],
+    rootKeys: [A, B],
+    rootThreshold: 2,
+    targetsKeys: targetKeys,
+    targetsThreshold,
+  });
+  h.addSignature(v1, A);
+  h.addSignature(v1, B);
+  return { A, B, v1 };
+}
+
+function delegatedInput({ v1, targets, targetName, delegated = null }) {
+  return {
+    reviewTime: REVIEW_TIME,
+    roots: [h.toText(v1)],
+    targets: h.toText(targets),
+    targetName,
+    delegatedTargets: delegated ? h.toText(delegated) : null,
+  };
+}
+
+const sha256Text = (text) => createHash('sha256').update(text).digest('hex');
+
+test('委托命中：具体目标由命中路径的委托角色发布，给出角色/规则/签名者/摘要', async () => {
+  const { input } = buildDelegatedTarget();
+  const result = await verifyReview(input);
+  assert(result.ok, `应允许：${JSON.stringify(result.evidence)}`);
+  assertEq(result.summary.adoptedRole, 'pkg');
+  assertEq(result.summary.matchedPath, 'pkg/*');
+  assertEq(result.summary.targetSigners.length, 2, '达阈值的不同签名者应为 2 个');
+  assertEq(result.summary.targetSignerRequired, 2);
+  assertEq(result.summary.targetName, 'pkg/app-2.0.0.bin');
+  assertEq(result.summary.targetDigest, `sha256:${sha256Text('delegated-payload')}`);
+  // 顶层 Targets 只有 other.txt，同名摘要不得来自顶层
+  assert(result.summary.targetDigest !== `sha256:${sha256Text('top-level-only')}`);
+  const hit = result.targets.delegationTrace.find((t) => t.status === 'accepted');
+  assertEq(hit.role, 'pkg');
+  assertEq(hit.matchedPath, 'pkg/*');
+});
+
+test('终止性委托签名失败：停止并拒绝，顶层同名摘要不得作为允许证据', async () => {
+  const { input } = buildDelegatedTerminatingFailure();
+  const result = await verifyReview(input);
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'DELEGATED_THRESHOLD_NOT_MET');
+  assertEq(result.finalRootVersion, 1, '保留既有根轮次证据');
+  assertEq(result.rounds.length, 1);
+  assertEq(result.targets.status, 'rejected');
+  const hit = result.targets.delegationTrace.find((t) => t.match);
+  assertEq(hit.status, 'rejected');
+  assertEq(hit.evidence.code, 'DELEGATED_THRESHOLD_NOT_MET');
+  assertEq(result.summary.adoptedRole ?? null, null, '不得采用任何角色');
+});
+
+test('未终止委托验签失败可继续：回退采用顶层同名目标', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top-level-payload') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { threshold: 1, paths: ['pkg/*'], terminating: false }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const delegated = h.makeDelegatedTargets({ targets: { [targetName]: h.targetMeta('child') } });
+  h.addSignature(delegated, D1);
+  delegated.signed.version = 9; // 签名后篡改 → BAD_SIGNATURE
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName, delegated }));
+  assert(result.ok, `未终止委托失败应回退顶层：${JSON.stringify(result.evidence)}`);
+  assertEq(result.summary.adoptedRole, 'targets');
+  assertEq(result.summary.matchedPath, null);
+  assertEq(result.summary.targetDigest, `sha256:${sha256Text('top-level-payload')}`);
+  const hit = result.targets.delegationTrace.find((t) => t.match);
+  assertEq(hit.status, 'rejected');
+  assertEq(hit.evidence.code, 'BAD_SIGNATURE');
+});
+
+test('终止性委托子元数据过期：停止拒绝，即使顶层同名也有效', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top-level-payload') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const delegated = h.makeDelegatedTargets({
+    expires: '2026-06-01T00:00:00Z',
+    targets: { [targetName]: h.targetMeta('child') },
+  });
+  h.addSignature(delegated, D1);
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName, delegated }));
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'DELEGATED_EXPIRED');
+});
+
+test('终止性委托子元数据格式失败（重复对象名）：停止拒绝', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const delegated = h.makeDelegatedTargets({ targets: { [targetName]: h.targetMeta('child') } });
+  h.addSignature(delegated, D1);
+  const tampered = h.toText(delegated).replace('"version": 1', '"version": 1, "version": 1');
+  const result = await verifyReview({
+    ...delegatedInput({ v1, targets, targetName, delegated }),
+    delegatedTargets: tampered,
+  });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'DUPLICATE_OBJECT_NAME');
+  assertEq(result.finalRootVersion, 1, '保留根轮次证据');
+});
+
+test('子元数据由委托声明之外的键签名：UNKNOWN_KEY，终止委托即拒绝', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const X = h.genKey('X');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const delegated = h.makeDelegatedTargets({ targets: { [targetName]: h.targetMeta('child') } });
+  h.addSignature(delegated, X); // 未在委托 keys 中声明
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName, delegated }));
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'UNKNOWN_KEY');
+});
+
+test('终止委托命中但未提供子元数据：拒绝并要求提供', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName }));
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'DELEGATED_METADATA_REQUIRED');
+});
+
+test('未终止委托命中但未提供子元数据：回退顶层目标', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'pkg/app-2.0.0.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'], terminating: false }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName }));
+  assert(result.ok, `应允许：${JSON.stringify(result.evidence)}`);
+  assertEq(result.summary.adoptedRole, 'targets');
+});
+
+test('提供了子元数据但无任何路径规则命中：拒绝，不得采信无权子元数据', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'other/app.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'], terminating: false }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const delegated = h.makeDelegatedTargets({ targets: { [targetName]: h.targetMeta('child') } });
+  h.addSignature(delegated, D1);
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName, delegated }));
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'DELEGATED_PATH_NOT_MATCHED');
+});
+
+test('委托按声明顺序匹配：跳过不命中角色，采用首个命中的角色', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const D2 = h.genKey('D2');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1, D2] });
+  const targetName = 'pkg/app.bin';
+  const targets = h.makeTargets({
+    targets: { 'misc/x': h.targetMeta('x') },
+    delegations: h.delegationsOf([D1, D2], [
+      h.delegationRole('misc', [D1], { paths: ['misc/*'], terminating: true }),
+      h.delegationRole('pkg', [D2], { paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const delegated = h.makeDelegatedTargets({ targets: { [targetName]: h.targetMeta('child') } });
+  h.addSignature(delegated, D2);
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName, delegated }));
+  assert(result.ok, `应允许：${JSON.stringify(result.evidence)}`);
+  assertEq(result.summary.adoptedRole, 'pkg');
+  assertEq(result.targets.delegationTrace[0].role, 'misc');
+  assertEq(result.targets.delegationTrace[0].status, 'skipped');
+  assertEq(result.targets.delegationTrace[1].status, 'accepted');
+});
+
+test('目标在终止委托子元数据中缺失：拒绝，顶层同名不得放行', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targetName = 'pkg/app.bin';
+  const targets = h.makeTargets({
+    targets: { [targetName]: h.targetMeta('top') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'], terminating: true }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const delegated = h.makeDelegatedTargets({ targets: { 'pkg/other.bin': h.targetMeta('child') } });
+  h.addSignature(delegated, D1);
+  const result = await verifyReview(delegatedInput({ v1, targets, targetName, delegated }));
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'TARGET_NOT_FOUND');
+});
+
+test('目标在顶层与所有可用委托中均缺失：TARGET_NOT_FOUND', async () => {
+  const Ta = h.genKey('Ta');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [] });
+  const targets = h.makeTargets({ targets: { 'a.txt': h.targetMeta('a') } });
+  h.addSignature(targets, Ta);
+  const result = await verifyReview({
+    reviewTime: REVIEW_TIME,
+    roots: [h.toText(v1)],
+    targets: h.toText(targets),
+    targetName: 'missing.bin',
+  });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'TARGET_NOT_FOUND');
+});
+
+test('无 delegations 字段时指定目标：由顶层 Targets 直接授权', async () => {
+  const Ta = h.genKey('Ta');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [] });
+  const targets = h.makeTargets({ targets: { 'a.txt': h.targetMeta('aaa') } });
+  h.addSignature(targets, Ta);
+  const result = await verifyReview({
+    reviewTime: REVIEW_TIME,
+    roots: [h.toText(v1)],
+    targets: h.toText(targets),
+    targetName: 'a.txt',
+  });
+  assert(result.ok, `应允许：${JSON.stringify(result.evidence)}`);
+  assertEq(result.summary.adoptedRole, 'targets');
+  assertEq(result.summary.targetDigest, `sha256:${sha256Text('aaa')}`);
+});
+
+test('重复委托角色名：DUPLICATE_DELEGATED_ROLE 且保留根轮次证据', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targets = h.makeTargets({
+    targets: { 'pkg/a': h.targetMeta('a') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'] }),
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'] }),
+    ]),
+  });
+  h.addSignature(targets, Ta);
+  const result = await verifyReview({
+    reviewTime: REVIEW_TIME,
+    roots: [h.toText(v1)],
+    targets: h.toText(targets),
+    targetName: 'pkg/a',
+  });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'DUPLICATE_DELEGATED_ROLE');
+  assertEq(result.finalRootVersion, 1, '根轮次证据保留');
+  assertEq(result.targets.status, 'rejected');
+});
+
+test('非法路径规则：INVALID_DELEGATION 指出角色与规则', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  for (const bad of ['pkg/[a', '**/x', 'pkg/**/x', 'pkg/[', '']) {
+    const targets = h.makeTargets({
+      targets: { 'pkg/a': h.targetMeta('a') },
+      delegations: h.delegationsOf([D1], [
+        h.delegationRole('pkg', [D1], { paths: [bad] }),
+      ]),
+    });
+    h.addSignature(targets, Ta);
+    const result = await verifyReview({
+      reviewTime: REVIEW_TIME,
+      roots: [h.toText(v1)],
+      targets: h.toText(targets),
+      targetName: 'pkg/a',
+    });
+    assert(!result.ok, `非法规则应拒绝：${bad}`);
+    assertEq(result.evidence.code, 'INVALID_DELEGATION', bad);
+  }
+});
+
+test('路径规则语义：* 不跨目录，** 仅末尾递归', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const build = (pattern, queried) => {
+    const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+    const targets = h.makeTargets({
+      targets: { [queried]: h.targetMeta('top') },
+      delegations: h.delegationsOf([D1], [
+        h.delegationRole('r', [D1], { paths: [pattern], terminating: false }),
+      ]),
+    });
+    h.addSignature(targets, Ta);
+    return verifyReview({
+      reviewTime: REVIEW_TIME,
+      roots: [h.toText(v1)],
+      targets: h.toText(targets),
+      targetName: queried,
+    });
+  };
+  // pkg/* 不匹配嵌套路径 → 未终止回退顶层 → 允许且采用顶层
+  const nested = await build('pkg/*', 'pkg/sub/a.bin');
+  assert(nested.ok, `顶层回退应允许：${JSON.stringify(nested.evidence)}`);
+  assertEq(nested.summary.adoptedRole, 'targets');
+  // pkg/** 匹配嵌套路径 → 未终止且无子元数据 → 回退顶层，但 trace 应记录命中
+  const rec = await build('pkg/**', 'pkg/sub/a.bin');
+  assert(rec.ok, `顶层回退应允许：${JSON.stringify(rec.evidence)}`);
+  assertEq(rec.targets.delegationTrace[0].match, true);
+  assertEq(rec.targets.delegationTrace[0].matchedPath, 'pkg/**');
+});
+
+test('委托密钥仅接受 Ed25519：非 Ed25519 键即 INVALID_DELEGATION', async () => {
+  const Ta = h.genKey('Ta');
+  const D1 = h.genKey('D1');
+  const { v1 } = delegatedBase({ targetKeys: [Ta], delegKeys: [D1] });
+  const targets = h.makeTargets({
+    targets: { 'pkg/a': h.targetMeta('a') },
+    delegations: h.delegationsOf([D1], [
+      h.delegationRole('pkg', [D1], { paths: ['pkg/*'] }),
+    ]),
+  });
+  targets.signed.delegations.keys[0].keytype = 'rsa';
+  h.addSignature(targets, Ta);
+  const result = await verifyReview({
+    reviewTime: REVIEW_TIME,
+    roots: [h.toText(v1)],
+    targets: h.toText(targets),
+    targetName: 'pkg/a',
+  });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'INVALID_DELEGATION');
+  assertEq(result.evidence.reason, 'UNSUPPORTED_KEYTYPE');
+});
+
+test('未填目标名却提供子元数据：录入校验拒绝', async () => {
+  const { input } = buildDelegatedTarget();
+  const result = await verifyReview({ ...input, targetName: '' });
+  assert(!result.ok, '应拒绝');
+  assertEq(result.evidence.code, 'INVALID_TARGET_QUERY');
 });
 
 // ---------- 运行器 ----------

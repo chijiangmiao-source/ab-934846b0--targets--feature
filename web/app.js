@@ -39,15 +39,19 @@ function collectInput() {
     reviewTime: $('review-time').value.trim(),
     roots,
     targets: $('targets-input').value.trim(),
+    targetName: $('target-name').value.trim(),
+    delegatedTargets: $('delegated-input').value.trim(),
   };
 }
 
-function fillInput({ reviewTime, roots, targets }) {
+function fillInput({ reviewTime, roots, targets, targetName, delegatedTargets }) {
   $('review-time').value = reviewTime ?? '';
   for (let i = 0; i < MAX_ROOTS; i++) {
     $(`root-${i}`).value = roots?.[i] ?? '';
   }
   $('targets-input').value = targets ?? '';
+  $('target-name').value = targetName ?? '';
+  $('delegated-input').value = delegatedTargets ?? '';
 }
 
 // ---------- Worker ----------
@@ -131,6 +135,78 @@ function renderRounds(rounds) {
   }
 }
 
+function renderDelegationTrace(trace) {
+  const wrap = el('div', 'delegation');
+  wrap.appendChild(el('p', 'note strong-note', '顶层 Targets 委托解析（按声明顺序匹配目标名）'));
+  if (!trace || trace.length === 0) {
+    wrap.appendChild(el('p', 'note', '未产生任何委托解析记录（顶层 Targets 未声明 delegations，或其声明在下方被阻断）。'));
+    return wrap;
+  }
+  for (const entry of trace) {
+    const row = el('div', `deleg-row ${entry.status}`);
+    const head = el('div', 'deleg-head');
+    const term = entry.terminating ? '终止性' : '未终止';
+    head.appendChild(el('span', 'deleg-name', `角色 ${entry.role}（${term}）`));
+    const statusText = {
+      skipped: '路径未命中 · 跳过',
+      missing: '命中但未提供子元数据 · 继续',
+      rejected: entry.match ? '命中 · 校验失败' : '路径未命中',
+      accepted: '命中 · 采用',
+    }[entry.status] ?? entry.status;
+    const ok = entry.status === 'accepted';
+    const neutral = entry.status === 'skipped' || entry.status === 'missing';
+    const badge = neutral
+      ? el('span', 'badge neutral', statusText)
+      : statusBadge(ok, statusText, statusText);
+    head.appendChild(badge);
+    row.appendChild(head);
+    const pathLine = el('p', 'note');
+    pathLine.textContent = `路径规则：${entry.paths.join('、')}` +
+      (entry.matchedPath ? `　命中：${entry.matchedPath}` : '　（无命中）');
+    row.appendChild(pathLine);
+    if (entry.signers) {
+      row.appendChild(signerLine('委托角色达阈值签名者', {
+        required: entry.required,
+        signers: entry.signers,
+      }));
+    }
+    if (entry.version) {
+      row.appendChild(el('p', 'note', `受委托 Targets v${entry.version}，过期时间 ${entry.expires}`));
+    }
+    if (entry.evidence) row.appendChild(evidenceBlock(entry.evidence));
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+function renderResolution(resolution) {
+  if (!resolution) return null;
+  const box = el('div', 'resolution');
+  box.appendChild(el('p', 'note strong-note', '最终目标判定'));
+  const line1 = el('p', 'note');
+  line1.appendChild(el('span', null, `目标 ${resolution.target} 实际采用角色：`));
+  line1.appendChild(el('code', 'chip', resolution.adoptedRole));
+  box.appendChild(line1);
+  const line2 = el('p', 'note');
+  line2.textContent = resolution.matchedPath
+    ? `命中的路径规则：${resolution.matchedPath}`
+    : '未命中任何委托路径规则，由顶层 targets 角色直接发布';
+  box.appendChild(line2);
+  box.appendChild(signerLine('达阈值的不同签名者', {
+    required: resolution.required,
+    signers: resolution.signers,
+  }));
+  const alg = Object.prototype.hasOwnProperty.call(resolution.meta.hashes, 'sha256')
+    ? 'sha256'
+    : Object.keys(resolution.meta.hashes)[0];
+  const digest = el('p', 'note digest-line');
+  digest.appendChild(el('span', null, '最终目标摘要：'));
+  digest.appendChild(el('code', 'chip digest', `${alg}:${resolution.meta.hashes[alg]}`));
+  digest.appendChild(el('span', null, `（length ${resolution.meta.length}）`));
+  box.appendChild(digest);
+  return box;
+}
+
 function renderTargetsStage(targets) {
   const container = $('targets-stage');
   container.replaceChildren();
@@ -158,6 +234,11 @@ function renderTargetsStage(targets) {
     card.appendChild(el('p', 'note', `目标摘要：共 ${targets.targetNames.length} 个目标`));
     card.appendChild(list);
   }
+  if (targets.targetName) {
+    card.appendChild(renderDelegationTrace(targets.delegationTrace));
+    const resolutionNode = renderResolution(targets.resolution);
+    if (resolutionNode) card.appendChild(resolutionNode);
+  }
   if (targets.evidence) card.appendChild(evidenceBlock(targets.evidence));
   container.appendChild(card);
 }
@@ -175,9 +256,22 @@ function renderConclusion(result) {
   );
   if (result.ok) {
     const summary = result.summary;
-    card.appendChild(
-      el('p', 'note', `最终允许的目标摘要：Targets v${summary.targetsVersion}，共 ${summary.targetCount} 个目标（${summary.targetNames.join('、') || '无'}）`)
-    );
+    if (summary.targetName) {
+      card.appendChild(
+        el('p', 'note', `最终目标：${summary.targetName}，实际采用角色 ${summary.adoptedRole}` +
+          (summary.matchedPath ? `（命中路径规则 ${summary.matchedPath}）` : '（顶层 targets 直接发布）'))
+      );
+      card.appendChild(
+        el('p', 'note', `最终目标摘要：${summary.targetDigest}（length ${summary.targetLength}）`)
+      );
+      card.appendChild(
+        el('p', 'note', `达阈值的不同签名者：${summary.targetSigners.length}/${summary.targetSignerRequired}`)
+      );
+    } else {
+      card.appendChild(
+        el('p', 'note', `最终允许的目标摘要：Targets v${summary.targetsVersion}，共 ${summary.targetCount} 个目标（${summary.targetNames.join('、') || '无'}）`)
+      );
+    }
   } else if (result.evidence) {
     card.appendChild(evidenceBlock(result.evidence));
   }

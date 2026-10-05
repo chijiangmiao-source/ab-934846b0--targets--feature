@@ -31,6 +31,17 @@
           placeholder='{"signed":{"_type":"targets",...},"signatures":[...]}'></textarea>
       </label>
 
+      <label class="field">
+        <span>待判定目标名（可选；填写后判定该目标实际由哪个角色发布，留空则仅复核顶层 Targets）</span>
+        <input id="target-name" type="text" spellcheck="false" placeholder="例如：pkg/app-2.0.0.bin">
+      </label>
+
+      <label class="field">
+        <span>受委托 Targets 元数据（可选；仅当目标名命中顶层 delegations 路径规则时提供 1 份）</span>
+        <textarea id="delegated-input" rows="7" spellcheck="false"
+          placeholder='{"signed":{"_type":"targets",...},"signatures":[...]}'></textarea>
+      </label>
+
       <div class="actions">
         <button id="btn-verify" class="primary">开始离线复核</button>
         <button id="btn-clear" type="button">清空</button>
@@ -39,6 +50,8 @@
           <button type="button" data-fixture="legit-rotation">合法轮换</button>
           <button type="button" data-fixture="old-root-only">旧根单签拒绝</button>
           <button type="button" data-fixture="expired-targets">过期 Targets</button>
+          <button type="button" data-fixture="delegated-target">委托目标授权</button>
+          <button type="button" data-fixture="delegated-terminating-failure">终止委托失败拒绝</button>
         </span>
       </div>
       <p id="busy" class="busy" hidden>复核计算中（Worker）…</p>

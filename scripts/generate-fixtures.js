@@ -15,6 +15,8 @@ export async function generateFixtures(outDir) {
       reviewTime: scenario.input.reviewTime,
       roots: scenario.input.roots,
       targets: scenario.input.targets,
+      targetName: scenario.input.targetName ?? '',
+      delegatedTargets: scenario.input.delegatedTargets ?? '',
     };
     await writeFile(
       path.join(outDir, `${scenario.name}.json`),

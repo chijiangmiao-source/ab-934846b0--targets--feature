@@ -196,27 +196,21 @@ async function verifySignatures({ signedObj, signatures, keyLookup, thresholdSet
   return { value: perSet };
 }
 
-// ---------- Targets 阶段 ----------
+// ---------- Targets 文档解析 ----------
 
-async function verifyTargetsStage(trusted, targetsText, reviewMs) {
-  const stage = { stage: 'targets', status: 'rejected', signers: [], required: trusted.targetsRole.threshold };
+async function parseTargetsDocument(text) {
   let doc;
   try {
-    doc = parseJsonStrict(targetsText);
+    doc = parseJsonStrict(text);
   } catch (err) {
-    stage.evidence = parseEvidence(err);
-    return stage;
+    return { error: parseEvidence(err) };
   }
   const common = validateCommonSigned(doc, 'targets');
-  if (common.error) {
-    stage.evidence = common.error;
-    return stage;
-  }
+  if (common.error) return { error: common.error };
   const { signed } = common;
   const targetsMap = signed.targets ?? {};
   if (!targetsMap || typeof targetsMap !== 'object' || Array.isArray(targetsMap)) {
-    stage.evidence = evidence('INVALID_METADATA', 'targets 必须是对象');
-    return stage;
+    return { error: evidence('INVALID_METADATA', 'targets 必须是对象') };
   }
   for (const [name, meta] of Object.entries(targetsMap)) {
     const bad =
@@ -228,10 +222,218 @@ async function verifyTargetsStage(trusted, targetsText, reviewMs) {
       typeof meta.hashes !== 'object' ||
       Array.isArray(meta.hashes);
     if (bad) {
-      stage.evidence = evidence('INVALID_METADATA', `目标 ${JSON.stringify(name)} 的元数据无效`);
-      return stage;
+      return { error: evidence('INVALID_METADATA', `目标 ${JSON.stringify(name)} 的元数据无效`) };
     }
   }
+  return { value: { doc, signed, targetsMap } };
+}
+
+// ---------- 委托（delegations） ----------
+
+const RESERVED_ROLE_NAMES = new Set(['root', 'targets', 'snapshot', 'timestamp']);
+// TUF 路径规则中允许转义的字符（safe-char / sep-char / '*' / '?'）
+const ESCAPABLE_CHARS = new Set([
+  ..."-._~@/:=! #$%&'`^+;()*?",
+]);
+
+// 把 TUF 路径规则编译为整串匹配的正则：
+//  '*'  匹配单层（不含 '/'）任意字节序列；'?' 匹配单层单个字符；
+//  '**' 仅允许作为规则末尾（跨层递归匹配）；'\uXXXX' / '\UXXXXXXXX' 与标点转义；
+//  其余正则元字符（如未转义的 '['）一律视为非法规则。
+function compilePathPattern(pattern) {
+  if (typeof pattern !== 'string' || pattern === '') {
+    throw new Error('路径规则必须是非空字符串');
+  }
+  if (pattern.includes('\0')) throw new Error('路径规则不得含 NUL 字符');
+  let re = '^';
+  let i = 0;
+  const addLiteral = (ch) => {
+    re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  };
+  while (i < pattern.length) {
+    const c = pattern[i];
+    if (c === '\\') {
+      const nx = pattern[i + 1];
+      if (nx === 'u' || nx === 'U') {
+        const n = nx === 'u' ? 4 : 8;
+        const hex = pattern.slice(i + 2, i + 2 + n);
+        if (!new RegExp(`^[0-9a-fA-F]{${n}}$`).test(hex)) {
+          throw new Error('路径规则含非法 Unicode 转义');
+        }
+        const cp = parseInt(hex, 16);
+        if (cp > 0x10ffff) throw new Error('路径规则含超出 Unicode 范围的码点');
+        addLiteral(String.fromCodePoint(cp));
+        i += 2 + n;
+        continue;
+      }
+      if (!nx || !ESCAPABLE_CHARS.has(nx)) throw new Error('路径规则含非法转义');
+      addLiteral(nx);
+      i += 2;
+      continue;
+    }
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        if (i + 2 !== pattern.length) throw new Error("递归通配 '**' 只能位于路径规则末尾");
+        re += '.*';
+        i += 2;
+        continue;
+      }
+      re += '[^/]*';
+      i += 1;
+      continue;
+    }
+    if (c === '?') {
+      re += '[^/]';
+      i += 1;
+      continue;
+    }
+    if ('[]|<>'.includes(c)) throw new Error('路径规则含未转义的非法字符');
+    addLiteral(c);
+    i += 1;
+  }
+  return new RegExp(re + '$');
+}
+
+// 读取顶层 Targets 的 delegations；无 delegations 字段时返回空委托表（行为与旧规则一致）。
+async function readDelegations(signed) {
+  const delegations = signed.delegations;
+  if (delegations === undefined) return { value: { roles: [], keyMap: new Map() } };
+  if (!delegations || typeof delegations !== 'object' || Array.isArray(delegations)) {
+    return { error: evidence('INVALID_DELEGATION', 'delegations 必须是对象') };
+  }
+  const invalid = (message, details = {}) =>
+    evidence('INVALID_DELEGATION', message, details);
+  const keys = await buildKeyMap(delegations.keys);
+  if (keys.error) {
+    return {
+      error: invalid(`委托密钥表无效：${keys.error.message}`, {
+        reason: keys.error.code,
+      }),
+    };
+  }
+  if (!Array.isArray(delegations.roles) || delegations.roles.length === 0) {
+    return { error: invalid('delegations.roles 必须是非空数组') };
+  }
+  const roles = [];
+  const seenNames = new Set();
+  for (const item of delegations.roles) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return { error: invalid('委托角色项必须是对象') };
+    }
+    const name = item.name;
+    if (typeof name !== 'string' || name === '') {
+      return { error: invalid('委托角色 name 必须是非空字符串') };
+    }
+    if (RESERVED_ROLE_NAMES.has(name)) {
+      return { error: invalid(`委托角色名 ${JSON.stringify(name)} 与保留角色冲突`, { role: name }) };
+    }
+    if (seenNames.has(name)) {
+      return {
+        error: evidence('DUPLICATE_DELEGATED_ROLE', `委托角色重复声明：${JSON.stringify(name)}`, {
+          role: name,
+        }),
+      };
+    }
+    seenNames.add(name);
+    if (!Number.isInteger(item.threshold) || item.threshold < 1) {
+      return { error: invalid(`委托角色 ${JSON.stringify(name)} 阈值必须是 ≥1 的整数`, { role: name }) };
+    }
+    if (!Array.isArray(item.keyids) || item.keyids.length === 0) {
+      return { error: invalid(`委托角色 ${JSON.stringify(name)} keyids 必须是非空数组`, { role: name }) };
+    }
+    const keyids = [...new Set(item.keyids)];
+    for (const keyid of keyids) {
+      if (typeof keyid !== 'string' || !keys.map.has(keyid)) {
+        return { error: invalid(`委托角色 ${JSON.stringify(name)} 引用了未声明的键`, { role: name, keyid: String(keyid) }) };
+      }
+    }
+    if (!Array.isArray(item.paths) || item.paths.length === 0) {
+      return { error: invalid(`委托角色 ${JSON.stringify(name)} paths 必须是非空数组`, { role: name }) };
+    }
+    const patterns = [];
+    for (const p of item.paths) {
+      let compiled;
+      try {
+        compiled = compilePathPattern(p);
+      } catch (err) {
+        return {
+          error: invalid(`委托角色 ${JSON.stringify(name)} 的路径规则 ${JSON.stringify(p)} 非法：${err.message}`, {
+            role: name,
+            path: String(p),
+          }),
+        };
+      }
+      patterns.push({ raw: p, regexp: compiled });
+    }
+    const terminating = item.terminating === undefined ? false : item.terminating;
+    if (typeof terminating !== 'boolean') {
+      return { error: invalid(`委托角色 ${JSON.stringify(name)} terminating 必须是布尔值`, { role: name }) };
+    }
+    roles.push({ name, threshold: item.threshold, keyids, patterns, terminating });
+  }
+  return { value: { roles, keyMap: keys.map } };
+}
+
+function matchPath(role, targetName) {
+  return role.patterns.find((p) => p.regexp.test(targetName))?.raw ?? null;
+}
+
+function digestOf(meta) {
+  const alg = Object.prototype.hasOwnProperty.call(meta.hashes, 'sha256')
+    ? 'sha256'
+    : Object.keys(meta.hashes)[0];
+  return { alg, hash: meta.hashes[alg], length: meta.length };
+}
+
+// 核验一份命中委托的子 Targets：仅接受父委托声明的 Ed25519 键与该角色阈值。
+// 返回 { error } 或 { signers, version, expires, targetsMap, expired }。
+async function verifyDelegatedMetadata(entry, delegatedText, reviewMs, keyMap) {
+  const parsed = await parseTargetsDocument(delegatedText);
+  if (parsed.error) return { error: parsed.error };
+  const { doc, signed, targetsMap } = parsed.value;
+  const sigResult = await verifySignatures({
+    signedObj: signed,
+    signatures: doc.signatures,
+    keyLookup: keyMap,
+    thresholdSets: [{ name: 'delegated', keyids: entry.keyids, threshold: entry.threshold }],
+  });
+  if (sigResult.error) return { error: sigResult.error };
+  const signers = sigResult.value.delegated.signers;
+  if (signers.length < entry.threshold) {
+    return {
+      error: evidence('DELEGATED_THRESHOLD_NOT_MET', `委托角色 ${JSON.stringify(entry.name)} 签名未达阈值`, {
+        role: entry.name,
+        required: entry.threshold,
+        got: signers.length,
+      }),
+    };
+  }
+  if (reviewMs > Date.parse(signed.expires)) {
+    return {
+      error: evidence('DELEGATED_EXPIRED', `审查时刻晚于委托角色 ${JSON.stringify(entry.name)} 元数据的过期时间`, {
+        role: entry.name,
+        expires: signed.expires,
+      }),
+    };
+  }
+  return { value: { signers, version: signed.version, expires: signed.expires, targetsMap } };
+}
+
+// ---------- Targets 阶段 ----------
+
+async function verifyTargetsStage(trusted, targetsText, reviewMs, targetName, delegatedText) {
+  const stage = {
+    stage: 'targets',
+    status: 'rejected',
+    signers: [],
+    required: trusted.targetsRole.threshold,
+  };
+  const parsed = await parseTargetsDocument(targetsText);
+  if (parsed.error) {
+    stage.evidence = parsed.error;
+    return stage;
+  }
+  const { doc, signed, targetsMap } = parsed.value;
   stage.version = signed.version;
   stage.expires = signed.expires;
   stage.targetNames = Object.keys(targetsMap).sort();
@@ -265,6 +467,136 @@ async function verifyTargetsStage(trusted, targetsText, reviewMs) {
     return stage;
   }
   stage.status = 'accepted';
+
+  // 未指定具体目标：维持既有「顶层 Targets 合法即通过」结论
+  if (!targetName) return stage;
+
+  stage.targetName = targetName;
+  stage.delegationTrace = [];
+  const delegationResult = await readDelegations(signed);
+  if (delegationResult.error) {
+    stage.status = 'rejected';
+    stage.evidence = delegationResult.error;
+    return stage;
+  }
+  const trace = stage.delegationTrace;
+  let anyMatch = false;
+
+  // 委托按声明顺序匹配目标名；首个命中的角色负责该目标。
+  for (const role of delegationResult.value.roles) {
+    const matchedPath = matchPath(role, targetName);
+    const entry = {
+      role: role.name,
+      paths: role.patterns.map((p) => p.raw),
+      terminating: role.terminating,
+      match: matchedPath !== null,
+      matchedPath,
+    };
+    if (matchedPath === null) {
+      entry.status = 'skipped';
+      trace.push(entry);
+      continue;
+    }
+    anyMatch = true;
+    if (!delegatedText) {
+      if (role.terminating) {
+        entry.status = 'rejected';
+        entry.evidence = evidence(
+          'DELEGATED_METADATA_REQUIRED',
+          `目标命中终止性委托 ${JSON.stringify(role.name)}，但未提供其受委托 Targets 元数据`,
+          { role: role.name, matchedPath }
+        );
+        trace.push(entry);
+        stage.status = 'rejected';
+        stage.evidence = entry.evidence;
+        return stage;
+      }
+      // 未终止委托且未提供子元数据：跳过，继续后续委托与顶层目标
+      entry.status = 'missing';
+      trace.push(entry);
+      continue;
+    }
+    const verified = await verifyDelegatedMetadata(role, delegatedText, reviewMs, delegationResult.value.keyMap);
+    entry.required = role.threshold;
+    if (verified.error) {
+      entry.status = 'rejected';
+      entry.evidence = verified.error;
+      trace.push(entry);
+      if (role.terminating) {
+        // 命中 terminating 委托：签名 / 格式 / 过期等任何失败都必须停止并拒绝
+        stage.status = 'rejected';
+        stage.evidence = verified.error;
+        return stage;
+      }
+      continue;
+    }
+    entry.signers = verified.value.signers;
+    entry.version = verified.value.version;
+    entry.expires = verified.value.expires;
+    const meta = Object.prototype.hasOwnProperty.call(verified.value.targetsMap, targetName)
+      ? verified.value.targetsMap[targetName]
+      : null;
+    if (meta) {
+      entry.status = 'accepted';
+      trace.push(entry);
+      stage.status = 'accepted';
+      stage.resolution = {
+        target: targetName,
+        adoptedRole: role.name,
+        matchedPath,
+        required: role.threshold,
+        signers: verified.value.signers,
+        meta,
+        ...digestOf(meta),
+      };
+      return stage;
+    }
+    // 子元数据中没有该目标
+    entry.status = 'rejected';
+    entry.evidence = evidence(
+      'TARGET_NOT_FOUND',
+      `委托角色 ${JSON.stringify(role.name)} 的元数据未声明目标 ${JSON.stringify(targetName)}`,
+      { role: role.name, target: targetName }
+    );
+    trace.push(entry);
+    if (role.terminating) {
+      stage.status = 'rejected';
+      stage.evidence = entry.evidence;
+      return stage;
+    }
+  }
+
+  // 未命中任何可用委托（或未终止委托均未提供目标）：回到顶层 Targets 判定
+  if (delegatedText && !anyMatch) {
+    // 提供的子元数据没有任何命中的委托为其授权——不得当作允许证据
+    stage.status = 'rejected';
+    stage.evidence = evidence(
+      'DELEGATED_PATH_NOT_MATCHED',
+      `所提供的受委托 Targets 元数据无对应授权：没有任何委托路径规则命中 ${JSON.stringify(targetName)}`,
+      { target: targetName }
+    );
+    return stage;
+  }
+  const topMeta = Object.prototype.hasOwnProperty.call(targetsMap, targetName) ? targetsMap[targetName] : null;
+  if (topMeta) {
+    stage.status = 'accepted';
+    stage.resolution = {
+      target: targetName,
+      adoptedRole: 'targets',
+      matchedPath: null,
+      required: trusted.targetsRole.threshold,
+      signers: stage.signers,
+      meta: topMeta,
+      ...digestOf(topMeta),
+    };
+    return stage;
+  }
+  stage.status = 'rejected';
+  stage.evidence = evidence(
+    'TARGET_NOT_FOUND',
+    `无可信角色声明目标 ${JSON.stringify(targetName)}：顶层 Targets 与可用委托中均缺失`,
+    { target: targetName }
+  );
   return stage;
 }
 
@@ -300,6 +632,11 @@ export async function verifyReview(input) {
     ? input.roots.filter((t) => typeof t === 'string' && t.trim() !== '')
     : [];
   const targetsText = input?.targets;
+  const targetNameRaw = input?.targetName;
+  const targetName = typeof targetNameRaw === 'string' ? targetNameRaw.trim() : '';
+  const delegatedRaw = input?.delegatedTargets;
+  const delegatedText =
+    typeof delegatedRaw === 'string' && delegatedRaw.trim() !== '' ? delegatedRaw.trim() : null;
 
   const reviewMs = Date.parse(reviewTime);
   if (!Number.isFinite(reviewMs)) return inputFailure('INVALID_REVIEW_TIME', '审查时刻无效');
@@ -309,6 +646,15 @@ export async function verifyReview(input) {
   }
   if (typeof targetsText !== 'string' || targetsText.trim() === '') {
     return inputFailure('NO_TARGETS', '缺少 Targets 元数据');
+  }
+  if (typeof targetNameRaw !== 'undefined' && targetNameRaw !== null && typeof targetNameRaw !== 'string') {
+    return inputFailure('INVALID_TARGET_NAME', '目标名必须是字符串');
+  }
+  if (targetName.includes('\0')) {
+    return inputFailure('INVALID_TARGET_NAME', '目标名不得含 NUL 字符');
+  }
+  if (delegatedText && !targetName) {
+    return inputFailure('INVALID_TARGET_QUERY', '提供了受委托 Targets 元数据但未填写目标名');
   }
 
   const rounds = [];
@@ -406,10 +752,28 @@ export async function verifyReview(input) {
     return failure(rounds, trusted, null, ev);
   }
 
-  // Targets 阶段：须由最终根的 targets 角色足额签名且未过期
-  const targetsStage = await verifyTargetsStage(trusted, targetsText, reviewMs);
+  // Targets 阶段：须由最终根的 targets 角色足额签名且未过期；
+  // 指定目标名时，再按声明顺序解析 delegations，判定该目标实际由哪个角色发布
+  const targetsStage = await verifyTargetsStage(trusted, targetsText, reviewMs, targetName, delegatedText);
   if (targetsStage.status !== 'accepted') {
     return failure(rounds, trusted, targetsStage, targetsStage.evidence);
+  }
+  const summary = {
+    finalRootVersion: trusted.version,
+    targetsVersion: targetsStage.version,
+    targetsExpires: targetsStage.expires,
+    targetsSigners: targetsStage.signers,
+    targetNames: targetsStage.targetNames,
+    targetCount: targetsStage.targetNames.length,
+  };
+  if (targetName) {
+    summary.targetName = targetName;
+    summary.adoptedRole = targetsStage.resolution.adoptedRole;
+    summary.matchedPath = targetsStage.resolution.matchedPath;
+    summary.targetSigners = targetsStage.resolution.signers;
+    summary.targetSignerRequired = targetsStage.resolution.required;
+    summary.targetDigest = `${targetsStage.resolution.alg}:${targetsStage.resolution.hash}`;
+    summary.targetLength = targetsStage.resolution.length;
   }
   return {
     ok: true,
@@ -417,13 +781,6 @@ export async function verifyReview(input) {
     finalRootVersion: trusted.version,
     rounds,
     targets: targetsStage,
-    summary: {
-      finalRootVersion: trusted.version,
-      targetsVersion: targetsStage.version,
-      targetsExpires: targetsStage.expires,
-      targetsSigners: targetsStage.signers,
-      targetNames: targetsStage.targetNames,
-      targetCount: targetsStage.targetNames.length,
-    },
+    summary,
   };
 }
